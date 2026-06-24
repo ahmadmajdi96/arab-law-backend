@@ -36,8 +36,8 @@ services:
       - --metrics.prometheus.addrouterslabels=true
       - --metrics.prometheus.addserviceslabels=true
     ports:
-      - "80:80"
-      - "8080:8080"
+      - "5556:80"
+      - "5557:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
@@ -160,7 +160,7 @@ services:
       - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
     ports:
-      - "9090:9090"
+      - "5558:9090"
     networks:
       - monitoring
       - public
@@ -178,7 +178,7 @@ services:
       - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     ports:
-      - "3001:3000"
+      - "5559:3000"
     depends_on:
       - prometheus
       - loki
@@ -194,7 +194,7 @@ services:
       - ./infra/loki/loki.yml:/etc/loki/local-config.yml:ro
       - loki-data:/loki
     ports:
-      - "3100:3100"
+      - "5560:3100"
     networks:
       - monitoring
     restart: unless-stopped
@@ -220,8 +220,8 @@ services:
       - ./infra/tempo/tempo.yml:/etc/tempo.yml:ro
       - tempo-data:/tmp/tempo
     ports:
-      - "3200:3200"
-      - "4317:4317"
+      - "5561:3200"
+      - "5562:4317"
     networks:
       - monitoring
     restart: unless-stopped
@@ -232,8 +232,8 @@ services:
     volumes:
       - ./infra/otel/collector.yml:/etc/otelcol/config.yml:ro
     ports:
-      - "4318:4318"
-      - "8889:8889"
+      - "5563:4318"
+      - "5564:8889"
     depends_on:
       - tempo
     networks:
@@ -250,7 +250,7 @@ services:
       - /var/lib/docker/:/var/lib/docker:ro
       - /dev/disk/:/dev/disk:ro
     ports:
-      - "8081:8080"
+      - "5565:8080"
     networks:
       - monitoring
     restart: unless-stopped
@@ -272,7 +272,7 @@ services:
     volumes:
       - ./infra/blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
     ports:
-      - "9115:9115"
+      - "5566:9115"
     networks:
       - monitoring
       - public

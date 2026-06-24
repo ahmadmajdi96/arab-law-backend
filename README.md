@@ -54,12 +54,17 @@ docker compose up --build --scale api=3 --scale worker=2
 
 Useful local URLs:
 
-- API through Traefik: `http://api.localhost`
-- Traefik dashboard: `http://localhost:8080`
-- Prometheus: `http://localhost:9090`
-- Grafana: `http://localhost:3001` (`admin` / `admin` unless overridden)
-- Loki: `http://localhost:3100`
-- Tempo: `http://localhost:3200`
+- API through Traefik: `http://api.localhost:5556`
+- Traefik dashboard: `http://localhost:5557`
+- Prometheus: `http://localhost:5558`
+- Grafana: `http://localhost:5559` (`admin` / `admin` unless overridden)
+- Loki: `http://localhost:5560`
+- Tempo: `http://localhost:5561`
+- Tempo OTLP gRPC: `localhost:5562`
+- OpenTelemetry OTLP HTTP: `http://localhost:5563`
+- OpenTelemetry Collector metrics: `http://localhost:5564`
+- cAdvisor: `http://localhost:5565`
+- Blackbox exporter: `http://localhost:5566`
 
 ## Supabase migration
 
