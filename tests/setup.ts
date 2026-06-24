@@ -1,0 +1,10 @@
+process.env.NODE_ENV = "test";
+process.env.SUPABASE_URL = "https://example.supabase.co";
+process.env.SUPABASE_PUBLISHABLE_KEY = "test-publishable-key";
+process.env.SUPABASE_SERVICE_ROLE_KEY = "test-service-role-key";
+process.env.CRON_SECRET = "test-cron-secret-with-length";
+process.env.PAYMENT_WEBHOOK_SECRET = "test-payment-secret-with-length";
+process.env.MEETING_TOKEN_SECRET = "test-meeting-secret-with-enough-length";
+process.env.NOVITA_API_KEY = "test-novita-key";
+process.env.OTEL_ENABLED = "false";
+process.env.QUEUE_ENABLED = "false";
