@@ -54,7 +54,7 @@ docker compose up --build --scale api=3 --scale worker=2
 
 Useful local URLs:
 
-- API through Traefik: `http://api.localhost:5556`
+- API through Traefik: `http://localhost:5556` or any host pointed at port `5556`
 - Traefik dashboard: `http://localhost:5557`
 - Prometheus: `http://localhost:5558`
 - Grafana: `http://localhost:5559` (`admin` / `admin` unless overridden)
@@ -65,6 +65,13 @@ Useful local URLs:
 - OpenTelemetry Collector metrics: `http://localhost:5564`
 - cAdvisor: `http://localhost:5565`
 - Blackbox exporter: `http://localhost:5566`
+
+By default this compose setup is temporarily permissive:
+
+- Traefik routes all hostnames on port `5556` to the API.
+- `CORS_ORIGINS=*` allows browser requests from any frontend origin.
+
+Before production hardening, replace `CORS_ORIGINS=*` with explicit frontend origins and change the Traefik API router rule back to a specific `Host(...)` rule.
 
 ## Supabase migration
 
