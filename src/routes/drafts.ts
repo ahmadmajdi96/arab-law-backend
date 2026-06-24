@@ -1,130 +1,151 @@
+import { and, desc, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { callAiGateway } from "../services/ai-gateway.js";
-import { getCurrentMembership, unwrap } from "../utils/supabase.js";
+import { drafts } from "../db/schema.js";
+import { callAiGateway, getCaseContext } from "../services/ai-gateway.js";
+import { getRequestMembership } from "../utils/db.js";
+import { errors } from "../utils/errors.js";
+import { data, toApi } from "../utils/serialize.js";
 import { paginationSchema, parseBody, parseParams, parseQuery } from "../utils/validation.js";
-
-const draftSchema = z.object({
-  kind: z.enum(["pleading", "contract", "letter", "memo", "other"]),
-  title: z.string().min(1).max(240),
-  case_id: z.string().uuid().optional(),
-  client_id: z.string().uuid().optional(),
-  body: z.string().default(""),
-  language: z.enum(["ar", "en"]).default("ar"),
-});
 
 export async function registerDraftRoutes(app: FastifyInstance) {
   app.get("/v1/drafts", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const query = parseQuery(
       request,
-      z.object({
-        caseId: z.string().uuid().optional(),
-        clientId: z.string().uuid().optional(),
-        ...paginationSchema,
-      }),
+      z.object({ caseId: z.string().uuid().optional(), ...paginationSchema }),
     );
-    let builder = request
-      .supabase!.from("drafts")
-      .select("*")
-      .order("updated_at", { ascending: false })
-      .range(query.offset, query.offset + query.limit - 1);
-    if (query.caseId) builder = builder.eq("case_id", query.caseId);
-    if (query.clientId) builder = builder.eq("client_id", query.clientId);
-    return { data: unwrap(await builder) };
+    const filters = [eq(drafts.orgId, membership.orgId)];
+    if (query.caseId) filters.push(eq(drafts.caseId, query.caseId));
+    const rows = await app.db
+      .select()
+      .from(drafts)
+      .where(and(...filters))
+      .orderBy(desc(drafts.updatedAt))
+      .limit(query.limit)
+      .offset(query.offset);
+    return data(rows);
   });
 
   app.post("/v1/drafts", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
-    const body = parseBody(request, draftSchema);
-    const draft = unwrap(
-      await request
-        .supabase!.from("drafts")
-        .insert({
-          ...body,
-          org_id: membership.org_id,
-          created_by: request.auth!.userId,
-        })
-        .select("*")
-        .single(),
-    );
-    return { data: draft };
-  });
-
-  app.post("/v1/drafts/generate", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const body = parseBody(
       request,
       z.object({
-        kind: z.enum(["pleading", "contract", "letter", "memo", "other"]),
         title: z.string().min(1),
-        facts: z.string().min(1),
-        instructions: z.string().optional(),
+        kind: z.string().default("memo"),
+        content: z.string().default(""),
         case_id: z.string().uuid().optional(),
-        client_id: z.string().uuid().optional(),
-        language: z.enum(["ar", "en"]).default("ar"),
+        metadata: z.record(z.unknown()).optional(),
       }),
     );
+    const [draft] = await app.db
+      .insert(drafts)
+      .values({
+        orgId: membership.orgId,
+        title: body.title,
+        kind: body.kind,
+        content: body.content,
+        caseId: body.case_id,
+        createdBy: request.auth!.userId,
+        metadata: body.metadata ?? {},
+      })
+      .returning();
+    return data(draft);
+  });
 
+  app.post("/v1/drafts/generate", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
+    const body = parseBody(
+      request,
+      z.object({
+        title: z.string().min(1),
+        kind: z.string().default("memo"),
+        prompt: z.string().min(1),
+        case_id: z.string().uuid().optional(),
+        model: z.string().optional(),
+      }),
+    );
+    const context = body.case_id
+      ? await getCaseContext(app.db, membership.orgId, body.case_id)
+      : undefined;
     const ai = await callAiGateway({
-      admin: app.supabaseAdmin,
-      orgId: membership.org_id,
+      db: app.db,
+      orgId: membership.orgId,
       userId: request.auth!.userId,
       feature: "draft.generate",
+      model: body.model,
       messages: [
         {
           role: "system",
           content:
-            "You are a senior legal drafting assistant for Jordanian law. Draft precise, professional legal text. Do not invent citations. If facts are missing, leave bracketed placeholders.",
+            "Draft a clear legal document for a Jordanian law practice. Use professional structure and avoid unsupported citations.",
         },
         {
           role: "user",
-          content: JSON.stringify(body),
+          content: JSON.stringify({ prompt: body.prompt, kind: body.kind, case_context: context }),
         },
       ],
-      metadata: { kind: body.kind, case_id: body.case_id },
+      metadata: { case_id: body.case_id },
     });
 
-    const draft = unwrap(
-      await request
-        .supabase!.from("drafts")
-        .insert({
-          org_id: membership.org_id,
-          case_id: body.case_id,
-          client_id: body.client_id,
-          kind: body.kind,
-          title: body.title,
-          body: ai.text,
-          language: body.language,
-          created_by: request.auth!.userId,
-          ai_usage: ai.usage,
-        })
-        .select("*")
-        .single(),
-    );
+    const [draft] = await app.db
+      .insert(drafts)
+      .values({
+        orgId: membership.orgId,
+        caseId: body.case_id,
+        title: body.title,
+        kind: body.kind,
+        content: ai.text,
+        createdBy: request.auth!.userId,
+        metadata: { generated: true },
+      })
+      .returning();
 
-    return { data: draft, usage: ai.usage };
+    return { data: toApi(draft), usage: ai.usage };
   });
 
   app.get("/v1/drafts/:id", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const draft = unwrap(await request.supabase!.from("drafts").select("*").eq("id", id).single());
-    return { data: draft };
+    const [draft] = await app.db
+      .select()
+      .from(drafts)
+      .where(and(eq(drafts.id, id), eq(drafts.orgId, membership.orgId)))
+      .limit(1);
+    if (!draft) throw errors.notFound("Draft not found");
+    return data(draft);
   });
 
   app.patch("/v1/drafts/:id", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const patch = parseBody(request, draftSchema.partial());
-    const draft = unwrap(
-      await request.supabase!.from("drafts").update(patch).eq("id", id).select("*").single(),
+    const body = parseBody(
+      request,
+      z.object({
+        title: z.string().min(1).optional(),
+        content: z.string().optional(),
+        status: z.string().optional(),
+        metadata: z.record(z.unknown()).optional(),
+      }),
     );
-    return { data: draft };
+    const [draft] = await app.db
+      .update(drafts)
+      .set({ ...body, updatedAt: new Date() })
+      .where(and(eq(drafts.id, id), eq(drafts.orgId, membership.orgId)))
+      .returning();
+    if (!draft) throw errors.notFound("Draft not found");
+    return data(draft);
   });
 
   app.delete("/v1/drafts/:id", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const draft = unwrap(
-      await request.supabase!.from("drafts").delete().eq("id", id).select("*").single(),
-    );
-    return { data: draft };
+    const [draft] = await app.db
+      .delete(drafts)
+      .where(and(eq(drafts.id, id), eq(drafts.orgId, membership.orgId)))
+      .returning();
+    if (!draft) throw errors.notFound("Draft not found");
+    return data(draft);
   });
 }

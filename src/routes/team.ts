@@ -1,125 +1,130 @@
+import { eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
+import { nanoid } from "nanoid";
 import { z } from "zod";
-import { getCurrentMembership, insertActivity, requireOrgRole, unwrap } from "../utils/supabase.js";
+import { organizationInvites, organizationMembers, organizations, users } from "../db/schema.js";
+import { getRequestMembership, insertActivity, requireOrgRole } from "../utils/db.js";
+import { errors } from "../utils/errors.js";
+import { data } from "../utils/serialize.js";
 import { parseBody, parseParams } from "../utils/validation.js";
-
-const roleSchema = z.enum(["partner", "associate", "paralegal", "client"]);
 
 export async function registerTeamRoutes(app: FastifyInstance) {
   app.get("/v1/team", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
-    const members = unwrap(
-      await request
-        .supabase!.from("organization_members")
-        .select("*, profiles(full_name, avatar_url)")
-        .eq("org_id", membership.org_id)
-        .order("created_at", { ascending: false }),
-    );
+    const { membership } = await getRequestMembership(app.db, request);
+    const members = await app.db
+      .select({
+        membership: organizationMembers,
+        user: {
+          id: users.id,
+          email: users.email,
+          fullName: users.fullName,
+          avatarUrl: users.avatarUrl,
+          status: users.status,
+        },
+      })
+      .from(organizationMembers)
+      .innerJoin(users, eq(users.id, organizationMembers.userId))
+      .where(eq(organizationMembers.orgId, membership.orgId));
 
-    return { data: members };
+    return data(members);
   });
 
   app.post("/v1/team/invites", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await requireOrgRole(request.supabase!, request.auth!.userId, [
+    const { membership, organization } = await requireOrgRole(app.db, request.auth!.userId, [
       "owner",
       "partner",
     ]);
     const body = parseBody(
       request,
       z.object({
-        email: z.string().email(),
-        role: roleSchema,
+        email: z
+          .string()
+          .email()
+          .transform((value) => value.toLowerCase()),
+        role: z.enum(["owner", "partner", "associate", "paralegal", "client"]).default("associate"),
       }),
     );
 
-    const invite = await app.supabaseAdmin.auth.admin.inviteUserByEmail(body.email, {
-      data: {
-        org_id: membership.org_id,
+    const token = nanoid(48);
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const [invite] = await app.db
+      .insert(organizationInvites)
+      .values({
+        orgId: membership.orgId,
+        email: body.email,
         role: body.role,
-      },
+        token,
+        invitedBy: request.auth!.userId,
+        expiresAt,
+      })
+      .returning();
+    if (!invite) throw errors.unavailable("Unable to create invite");
+
+    await insertActivity(app.db, {
+      orgId: membership.orgId,
+      userId: request.auth!.userId,
+      entityType: "organization_invite",
+      entityId: invite.id,
+      action: "created",
+      metadata: { email: body.email, role: body.role },
     });
 
-    if (invite.error) throw invite.error;
-
-    const row = unwrap(
-      await request
-        .supabase!.from("organization_members")
-        .insert({
-          org_id: membership.org_id,
-          invited_email: body.email,
-          user_id: invite.data.user?.id,
-          role: body.role,
-          status: "invited",
-        })
-        .select("*")
-        .single(),
-    );
-
-    await insertActivity(request.supabase!, {
-      org_id: membership.org_id,
-      user_id: request.auth!.userId,
-      entity_type: "team_member",
-      entity_id: (row as any).id,
-      action: "invited",
-      meta: { email: body.email, role: body.role },
+    return data({
+      ...invite,
+      organizationName: organization.name,
+      inviteUrl: `/accept-invite?token=${token}`,
     });
-
-    return { data: row };
   });
 
   app.patch("/v1/team/:id/role", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await requireOrgRole(request.supabase!, request.auth!.userId, [
-      "owner",
-      "partner",
-    ]);
+    const { membership } = await requireOrgRole(app.db, request.auth!.userId, ["owner", "partner"]);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const body = parseBody(request, z.object({ role: roleSchema }));
-    const member = unwrap(
-      await request
-        .supabase!.from("organization_members")
-        .update({ role: body.role })
-        .eq("id", id)
-        .eq("org_id", membership.org_id)
-        .select("*")
-        .single(),
+    const body = parseBody(
+      request,
+      z.object({
+        role: z.enum(["owner", "partner", "associate", "paralegal", "client"]),
+      }),
     );
 
-    await insertActivity(request.supabase!, {
-      org_id: membership.org_id,
-      user_id: request.auth!.userId,
-      entity_type: "team_member",
-      entity_id: id,
+    const [updated] = await app.db
+      .update(organizationMembers)
+      .set({ role: body.role, updatedAt: new Date() })
+      .where(eq(organizationMembers.id, id))
+      .returning();
+
+    if (!updated || updated.orgId !== membership.orgId)
+      throw errors.notFound("Team member not found");
+
+    await insertActivity(app.db, {
+      orgId: membership.orgId,
+      userId: request.auth!.userId,
+      entityType: "organization_member",
+      entityId: id,
       action: "role_updated",
-      meta: { role: body.role },
     });
 
-    return { data: member };
+    return data(updated);
   });
 
   app.delete("/v1/team/:id", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await requireOrgRole(request.supabase!, request.auth!.userId, [
-      "owner",
-      "partner",
-    ]);
+    const { membership } = await requireOrgRole(app.db, request.auth!.userId, ["owner", "partner"]);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const member = unwrap(
-      await request
-        .supabase!.from("organization_members")
-        .delete()
-        .eq("id", id)
-        .eq("org_id", membership.org_id)
-        .select("*")
-        .single(),
-    );
+    const [removed] = await app.db
+      .delete(organizationMembers)
+      .where(eq(organizationMembers.id, id))
+      .returning();
 
-    await insertActivity(request.supabase!, {
-      org_id: membership.org_id,
-      user_id: request.auth!.userId,
-      entity_type: "team_member",
-      entity_id: id,
+    if (!removed || removed.orgId !== membership.orgId)
+      throw errors.notFound("Team member not found");
+
+    await insertActivity(app.db, {
+      orgId: membership.orgId,
+      userId: request.auth!.userId,
+      entityType: "organization_member",
+      entityId: id,
       action: "removed",
     });
 
-    return { data: member };
+    return data(removed);
   });
 }

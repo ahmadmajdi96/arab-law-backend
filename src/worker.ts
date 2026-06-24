@@ -1,17 +1,16 @@
 import "./telemetry.js";
-import { createClient } from "@supabase/supabase-js";
 import { type Processor, Worker, type WorkerOptions } from "bullmq";
+import { and, eq } from "drizzle-orm";
 import { request } from "undici";
 import { env } from "./config/env.js";
+import { createDb, createPostgresClient } from "./db/client.js";
+import { notifications } from "./db/schema.js";
 import { getRedisConnection } from "./queues/index.js";
 import { jobsTotal } from "./services/metrics.js";
+import { markOverdueInvoices } from "./utils/db.js";
 
-const supabaseAdmin = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
-  auth: {
-    autoRefreshToken: false,
-    persistSession: false,
-  },
-});
+const sql = createPostgresClient();
+const db = createDb(sql);
 
 function createWorker(name: string, processor: Processor) {
   const options: WorkerOptions = {
@@ -39,23 +38,19 @@ function createWorker(name: string, processor: Processor) {
 const workers = [
   createWorker("billing", async (job) => {
     if (job.name === "overdue-sweep") {
-      const result = await supabaseAdmin.rpc("mark_invoices_overdue");
-      if (result.error) throw result.error;
-      return result.data;
+      const updated = await markOverdueInvoices(db);
+      return { updated };
     }
   }),
   createWorker("notifications", async (job) => {
     if (job.name !== "send-due-reminders") return;
-    const { data, error } = await supabaseAdmin
-      .from("notifications")
-      .select("*")
-      .lte("scheduled_at", new Date().toISOString())
-      .is("sent_at", null)
+    const rows = await db
+      .select()
+      .from(notifications)
+      .where(eq(notifications.deliveryStatus, "pending"))
       .limit(500);
 
-    if (error) throw error;
-
-    for (const notification of data ?? []) {
+    for (const notification of rows) {
       if (env.NOTIFICATION_WEBHOOK_URL) {
         await request(env.NOTIFICATION_WEBHOOK_URL, {
           method: "POST",
@@ -64,19 +59,22 @@ const workers = [
         });
       }
 
-      await supabaseAdmin
-        .from("notifications")
-        .update({ sent_at: new Date().toISOString() })
-        .eq("id", notification.id);
+      await db
+        .update(notifications)
+        .set({ deliveryStatus: "sent" })
+        .where(
+          and(eq(notifications.id, notification.id), eq(notifications.deliveryStatus, "pending")),
+        );
     }
 
-    return { sent: data?.length ?? 0 };
+    return { sent: rows.length };
   }),
 ];
 
 const shutdown = async (signal: string) => {
   console.info({ signal }, "Shutting down workers");
   await Promise.all(workers.map((worker) => worker.close()));
+  await sql.end({ timeout: 5 });
   process.exit(0);
 };
 

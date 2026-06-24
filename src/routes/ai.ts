@@ -1,7 +1,11 @@
+import { and, desc, eq, gte, lte } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { aiUsageEvents, courtroomSimulations, documents } from "../db/schema.js";
 import { callAiGateway, getCaseContext } from "../services/ai-gateway.js";
-import { getCurrentMembership, unwrap } from "../utils/supabase.js";
+import { getRequestMembership } from "../utils/db.js";
+import { errors } from "../utils/errors.js";
+import { data, toApi } from "../utils/serialize.js";
 import { parseBody, parseQuery } from "../utils/validation.js";
 
 const jordanLawSystemPrompt = `
@@ -15,7 +19,7 @@ If you cannot verify a source, say so and do not fabricate article numbers, case
 
 export async function registerAiRoutes(app: FastifyInstance) {
   app.post("/v1/ai/research/jordan", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const body = parseBody(
       request,
       z.object({
@@ -26,8 +30,8 @@ export async function registerAiRoutes(app: FastifyInstance) {
     );
 
     const ai = await callAiGateway({
-      admin: app.supabaseAdmin,
-      orgId: membership.org_id,
+      db: app.db,
+      orgId: membership.orgId,
       userId: request.auth!.userId,
       feature: "legal_research.jordan",
       model: body.model,
@@ -49,11 +53,11 @@ export async function registerAiRoutes(app: FastifyInstance) {
 
   app.post("/v1/ai/cases/:caseId/summarize", { preHandler: app.requireAuth }, async (request) => {
     const params = z.object({ caseId: z.string().uuid() }).parse(request.params);
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
-    const legalCase = await getCaseContext(request.supabase!, params.caseId);
+    const { membership } = await getRequestMembership(app.db, request);
+    const legalCase = await getCaseContext(app.db, membership.orgId, params.caseId);
     const ai = await callAiGateway({
-      admin: app.supabaseAdmin,
-      orgId: membership.org_id,
+      db: app.db,
+      orgId: membership.orgId,
       userId: request.auth!.userId,
       feature: "case.summarize",
       messages: [
@@ -62,7 +66,7 @@ export async function registerAiRoutes(app: FastifyInstance) {
           content:
             "Summarize the case file for a lawyer. Include facts, procedural posture, risks, missing information, and next actions. Do not invent facts.",
         },
-        { role: "user", content: JSON.stringify(legalCase) },
+        { role: "user", content: JSON.stringify(toApi(legalCase)) },
       ],
       metadata: { case_id: params.caseId },
     });
@@ -72,11 +76,11 @@ export async function registerAiRoutes(app: FastifyInstance) {
 
   app.post("/v1/ai/cases/:caseId/next-steps", { preHandler: app.requireAuth }, async (request) => {
     const params = z.object({ caseId: z.string().uuid() }).parse(request.params);
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
-    const legalCase = await getCaseContext(request.supabase!, params.caseId);
+    const { membership } = await getRequestMembership(app.db, request);
+    const legalCase = await getCaseContext(app.db, membership.orgId, params.caseId);
     const ai = await callAiGateway({
-      admin: app.supabaseAdmin,
-      orgId: membership.org_id,
+      db: app.db,
+      orgId: membership.orgId,
       userId: request.auth!.userId,
       feature: "case.next_steps",
       messages: [
@@ -85,7 +89,7 @@ export async function registerAiRoutes(app: FastifyInstance) {
           content:
             "Suggest practical next steps for a Jordanian legal matter. Return ordered actions, deadlines to consider, documents needed, and risk notes.",
         },
-        { role: "user", content: JSON.stringify(legalCase) },
+        { role: "user", content: JSON.stringify(toApi(legalCase)) },
       ],
       responseFormat: "json",
       metadata: { case_id: params.caseId },
@@ -99,18 +103,23 @@ export async function registerAiRoutes(app: FastifyInstance) {
     { preHandler: app.requireAuth },
     async (request) => {
       const { documentId } = z.object({ documentId: z.string().uuid() }).parse(request.params);
-      const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
-      const document = unwrap(
-        await request.supabase!.from("documents").select("*").eq("id", documentId).single(),
-      ) as any;
-      const signed = await request
-        .supabase!.storage.from("documents")
-        .createSignedUrl(document.storage_path, 300);
-      if (signed.error) throw signed.error;
+      const { membership } = await getRequestMembership(app.db, request);
+      const [document] = await app.db
+        .select()
+        .from(documents)
+        .where(and(eq(documents.id, documentId), eq(documents.orgId, membership.orgId)))
+        .limit(1);
+      if (!document) throw errors.notFound("Document not found");
+
+      const signedUrl = await app.storage.signedDownloadUrl({
+        key: document.storagePath,
+        filename: document.name,
+        expiresIn: 300,
+      });
 
       const ai = await callAiGateway({
-        admin: app.supabaseAdmin,
-        orgId: membership.org_id,
+        db: app.db,
+        orgId: membership.orgId,
         userId: request.auth!.userId,
         feature: "document.extract_text",
         messages: [
@@ -119,7 +128,7 @@ export async function registerAiRoutes(app: FastifyInstance) {
             content:
               "Extract text from the provided document URL. Preserve structure where possible. If OCR is not possible, explain why.",
           },
-          { role: "user", content: signed.data.signedUrl },
+          { role: "user", content: signedUrl },
         ],
         metadata: { document_id: documentId },
       });
@@ -129,7 +138,7 @@ export async function registerAiRoutes(app: FastifyInstance) {
   );
 
   app.post("/v1/courtroom/simulations", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const body = parseBody(
       request,
       z.object({
@@ -138,36 +147,40 @@ export async function registerAiRoutes(app: FastifyInstance) {
         role: z.enum(["plaintiff", "defendant", "judge", "witness"]),
       }),
     );
-    const simulation = unwrap(
-      await request
-        .supabase!.from("courtroom_simulations")
-        .insert({
-          ...body,
-          org_id: membership.org_id,
-          user_id: request.auth!.userId,
-          transcript: [],
-        })
-        .select("*")
-        .single(),
-    );
-    return { data: simulation };
+    const [simulation] = await app.db
+      .insert(courtroomSimulations)
+      .values({
+        orgId: membership.orgId,
+        caseId: body.case_id,
+        scenario: body.scenario,
+        role: body.role,
+        userId: request.auth!.userId,
+        transcript: [],
+      })
+      .returning();
+    return data(simulation);
   });
 
   app.post(
     "/v1/courtroom/simulations/:id/turn",
     { preHandler: app.requireAuth },
     async (request) => {
-      const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+      const { membership } = await getRequestMembership(app.db, request);
       const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
       const body = parseBody(request, z.object({ user_message: z.string().min(1) }));
-      const simulation = unwrap(
-        await request.supabase!.from("courtroom_simulations").select("*").eq("id", id).single(),
-      ) as any;
-      const transcript = Array.isArray(simulation.transcript) ? simulation.transcript : [];
+      const [simulation] = await app.db
+        .select()
+        .from(courtroomSimulations)
+        .where(
+          and(eq(courtroomSimulations.id, id), eq(courtroomSimulations.orgId, membership.orgId)),
+        )
+        .limit(1);
+      if (!simulation) throw errors.notFound("Simulation not found");
 
+      const transcript = Array.isArray(simulation.transcript) ? simulation.transcript : [];
       const ai = await callAiGateway({
-        admin: app.supabaseAdmin,
-        orgId: membership.org_id,
+        db: app.db,
+        orgId: membership.orgId,
         userId: request.auth!.userId,
         feature: "courtroom.simulate_turn",
         messages: [
@@ -186,7 +199,7 @@ export async function registerAiRoutes(app: FastifyInstance) {
             }),
           },
         ],
-        metadata: { simulation_id: id, case_id: simulation.case_id },
+        metadata: { simulation_id: id, case_id: simulation.caseId },
       });
 
       const updatedTranscript = [
@@ -195,21 +208,18 @@ export async function registerAiRoutes(app: FastifyInstance) {
         { role: "assistant", content: ai.text, at: new Date().toISOString() },
       ];
 
-      const updated = unwrap(
-        await request
-          .supabase!.from("courtroom_simulations")
-          .update({ transcript: updatedTranscript })
-          .eq("id", id)
-          .select("*")
-          .single(),
-      );
+      const [updated] = await app.db
+        .update(courtroomSimulations)
+        .set({ transcript: updatedTranscript, updatedAt: new Date() })
+        .where(eq(courtroomSimulations.id, id))
+        .returning();
 
-      return { data: updated, usage: ai.usage };
+      return { data: toApi(updated), usage: ai.usage };
     },
   );
 
   app.get("/v1/ai/usage", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const query = parseQuery(
       request,
       z.object({
@@ -217,25 +227,26 @@ export async function registerAiRoutes(app: FastifyInstance) {
         to: z.string().datetime().optional(),
       }),
     );
-    let builder = app.supabaseAdmin
-      .from("ai_usage_events")
-      .select("*")
-      .eq("org_id", membership.org_id)
-      .order("created_at", { ascending: false })
+    const filters = [eq(aiUsageEvents.orgId, membership.orgId)];
+    if (query.from) filters.push(gte(aiUsageEvents.createdAt, new Date(query.from)));
+    if (query.to) filters.push(lte(aiUsageEvents.createdAt, new Date(query.to)));
+
+    const events = await app.db
+      .select()
+      .from(aiUsageEvents)
+      .where(and(...filters))
+      .orderBy(desc(aiUsageEvents.createdAt))
       .limit(1000);
-    if (query.from) builder = builder.gte("created_at", query.from);
-    if (query.to) builder = builder.lte("created_at", query.to);
-    const events = unwrap(await builder) as any[];
     const totals = events.reduce(
       (sum, event) => ({
-        prompt_tokens: sum.prompt_tokens + Number(event.prompt_tokens ?? 0),
-        completion_tokens: sum.completion_tokens + Number(event.completion_tokens ?? 0),
-        total_tokens: sum.total_tokens + Number(event.total_tokens ?? 0),
+        prompt_tokens: sum.prompt_tokens + Number(event.promptTokens ?? 0),
+        completion_tokens: sum.completion_tokens + Number(event.completionTokens ?? 0),
+        total_tokens: sum.total_tokens + Number(event.totalTokens ?? 0),
       }),
       { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     );
 
-    return { data: { totals, events } };
+    return { data: { totals, events: toApi(events) } };
   });
 }
 

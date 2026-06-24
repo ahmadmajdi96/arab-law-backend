@@ -9,11 +9,24 @@ x-api-common: &api-common
       required: false
   environment:
     NODE_ENV: production
+    DATABASE_URL: ${DATABASE_URL:-postgres://arab_law:arab_law_password@postgres:5432/arab_law}
+    DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
+    JWT_SECRET: ${JWT_SECRET:-local-development-jwt-secret-change-before-production}
+    S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+    S3_REGION: ${S3_REGION:-us-east-1}
+    S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-arab-law-minio}
+    S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-arab-law-minio-password}
+    S3_BUCKET: ${S3_BUCKET:-documents}
+    S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
     REDIS_URL: redis://redis:6379
     OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
   depends_on:
+    postgres:
+      condition: service_healthy
     redis:
       condition: service_healthy
+    minio-init:
+      condition: service_completed_successfully
     otel-collector:
       condition: service_started
   networks:
@@ -49,6 +62,7 @@ services:
     <<: *api-common
     labels:
       - traefik.enable=true
+      - traefik.docker.network=arab-law-backend_public
       - traefik.http.routers.api.rule=PathPrefix(`/`)
       - traefik.http.routers.api.entrypoints=web
       - traefik.http.services.api.loadbalancer.server.port=3000
@@ -89,6 +103,13 @@ services:
     environment:
       NODE_ENV: test
       LOG_LEVEL: silent
+      DATABASE_URL: ${DATABASE_URL:-postgres://arab_law:arab_law_password@postgres:5432/arab_law}
+      JWT_SECRET: ${JWT_SECRET:-local-development-jwt-secret-change-before-production}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-arab-law-minio}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-arab-law-minio-password}
+      S3_BUCKET: ${S3_BUCKET:-documents}
       QUEUE_ENABLED: "false"
       OTEL_ENABLED: "false"
       RATE_LIMIT_MAX: "10000000"
@@ -101,6 +122,29 @@ services:
       - public
       - internal
       - monitoring
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: deps
+    profiles:
+      - migrate
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://arab_law:arab_law_password@postgres:5432/arab_law}
+    working_dir: /app
+    command: ["npm", "run", "db:migrate"]
+    volumes:
+      - .:/app
+      - test-node-modules:/app/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
 
   worker:
     <<: *api-common
@@ -122,6 +166,82 @@ services:
         reservations:
           cpus: "0.25"
           memory: 256M
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-arab_law}
+      POSTGRES_USER: ${POSTGRES_USER:-arab_law}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-arab_law_password}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./drizzle:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5567:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+      - monitoring
+    restart: unless-stopped
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.19.1
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-arab_law}:${POSTGRES_PASSWORD:-arab_law_password}@postgres:5432/${POSTGRES_DB:-arab_law}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+      - monitoring
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-arab-law-minio}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-arab-law-minio-password}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "5568:9000"
+      - "5569:9001"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null || exit 1"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+      - monitoring
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        mc alias set local http://minio:9000 "$${S3_ACCESS_KEY_ID:-arab-law-minio}" "$${S3_SECRET_ACCESS_KEY:-arab-law-minio-password}" &&
+        mc mb --ignore-existing local/"$${S3_BUCKET:-documents}" &&
+        mc anonymous set none local/"$${S3_BUCKET:-documents}"
+    environment:
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-arab-law-minio}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-arab-law-minio-password}
+      S3_BUCKET: ${S3_BUCKET:-documents}
+    networks:
+      - internal
 
   redis:
     image: redis:7.4-alpine
@@ -280,6 +400,8 @@ services:
 
 volumes:
   redis-data:
+  postgres-data:
+  minio-data:
   prometheus-data:
   grafana-data:
   loki-data:

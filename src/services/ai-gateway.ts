@@ -1,9 +1,18 @@
 import { performance } from "node:perf_hooks";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import { and, eq, gte, sql } from "drizzle-orm";
 import { request } from "undici";
 import { env } from "../config/env.js";
+import type { AppDb } from "../db/client.js";
+import {
+  aiTokenBudgets,
+  aiUsageEvents,
+  caseEvents,
+  caseNotes,
+  caseParties,
+  cases,
+  clients,
+} from "../db/schema.js";
 import { errors } from "../utils/errors.js";
-import { unwrap, unwrapNullable } from "../utils/supabase.js";
 import { aiRequestDuration, aiRequestsTotal, aiTokensTotal } from "./metrics.js";
 
 export type ChatMessage = {
@@ -12,7 +21,7 @@ export type ChatMessage = {
 };
 
 export type AiGatewayInput = {
-  admin: SupabaseClient;
+  db: AppDb;
   orgId: string;
   userId: string;
   feature: string;
@@ -44,49 +53,40 @@ export function novitaChatCompletionsUrl(baseUrl = env.NOVITA_AI_BASE_URL) {
   return `${normalized}/v1/chat/completions`;
 }
 
-async function monthlyUsage(admin: SupabaseClient, orgId: string) {
+async function monthlyUsage(db: AppDb, orgId: string) {
   const since = new Date();
   since.setUTCDate(1);
   since.setUTCHours(0, 0, 0, 0);
 
-  const { data, error } = await admin
-    .from("ai_usage_events")
-    .select("total_tokens")
-    .eq("org_id", orgId)
-    .gte("created_at", since.toISOString());
-
-  if (error) {
-    return 0;
-  }
-
-  return (data ?? []).reduce((sum, row: any) => sum + Number(row.total_tokens ?? 0), 0);
+  const [row] = await db
+    .select({ total: sql<number>`coalesce(sum(${aiUsageEvents.totalTokens}), 0)` })
+    .from(aiUsageEvents)
+    .where(and(eq(aiUsageEvents.orgId, orgId), gte(aiUsageEvents.createdAt, since)));
+  return Number(row?.total ?? 0);
 }
 
-async function assertTokenBudget(
-  admin: SupabaseClient,
-  orgId: string,
-  estimatedPromptTokens: number,
-) {
+async function assertTokenBudget(db: AppDb, orgId: string, estimatedPromptTokens: number) {
   if (!env.AI_TOKEN_BUDGET_ENFORCEMENT) return;
 
-  const budget = unwrapNullable(
-    await admin.from("ai_token_budgets").select("*").eq("org_id", orgId).maybeSingle(),
-  ) as { monthly_token_limit?: number; hard_limit_enabled?: boolean } | null;
+  const [budget] = await db
+    .select()
+    .from(aiTokenBudgets)
+    .where(eq(aiTokenBudgets.orgId, orgId))
+    .limit(1);
 
-  if (!budget?.monthly_token_limit || budget.hard_limit_enabled === false) return;
+  if (!budget?.monthlyTokenLimit || budget.hardLimitEnabled === false) return;
 
-  const used = await monthlyUsage(admin, orgId);
-  if (used + estimatedPromptTokens > budget.monthly_token_limit) {
+  const used = await monthlyUsage(db, orgId);
+  if (used + estimatedPromptTokens > budget.monthlyTokenLimit) {
     throw errors.tooManyRequests("Monthly AI token budget exceeded", {
       used,
       estimatedPromptTokens,
-      monthlyLimit: budget.monthly_token_limit,
+      monthlyLimit: budget.monthlyTokenLimit,
     });
   }
 }
 
 async function recordUsage(
-  admin: SupabaseClient,
   input: AiGatewayInput,
   result: AiGatewayResult | undefined,
   latencyMs: number,
@@ -108,24 +108,21 @@ async function recordUsage(
     usage.completion_tokens,
   );
 
-  await admin
-    .from("ai_usage_events")
-    .insert({
-      org_id: input.orgId,
-      user_id: input.userId,
-      feature: input.feature,
-      model,
-      prompt_tokens: usage.prompt_tokens,
-      completion_tokens: usage.completion_tokens,
-      total_tokens: usage.total_tokens,
-      latency_ms: Math.round(latencyMs),
-      status,
-      meta: {
-        ...input.metadata,
-        error: error instanceof Error ? error.message : undefined,
-      },
-    })
-    .throwOnError();
+  await input.db.insert(aiUsageEvents).values({
+    orgId: input.orgId,
+    userId: input.userId,
+    feature: input.feature,
+    model,
+    promptTokens: usage.prompt_tokens,
+    completionTokens: usage.completion_tokens,
+    totalTokens: usage.total_tokens,
+    latencyMs: Math.round(latencyMs),
+    status,
+    metadata: {
+      ...input.metadata,
+      error: error instanceof Error ? error.message : undefined,
+    },
+  });
 }
 
 function extractText(payload: any) {
@@ -149,7 +146,7 @@ export async function callAiGateway(input: AiGatewayInput): Promise<AiGatewayRes
     throw errors.unavailable("NOVITA_API_KEY is required for AI calls");
   }
 
-  await assertTokenBudget(input.admin, input.orgId, estimateTokens(input.messages));
+  await assertTokenBudget(input.db, input.orgId, estimateTokens(input.messages));
 
   try {
     const response = await request(novitaChatCompletionsUrl(), {
@@ -194,31 +191,38 @@ export async function callAiGateway(input: AiGatewayInput): Promise<AiGatewayRes
       },
     };
 
-    await recordUsage(input.admin, input, result, performance.now() - start, "success");
+    await recordUsage(input, result, performance.now() - start, "success");
     return result;
   } catch (error) {
-    await recordUsage(
-      input.admin,
-      input,
-      undefined,
-      performance.now() - start,
-      "error",
-      error,
-    ).catch(() => undefined);
+    await recordUsage(input, undefined, performance.now() - start, "error", error).catch(
+      () => undefined,
+    );
     throw error;
   }
 }
 
-export async function getCaseContext(supabase: SupabaseClient, caseId: string) {
-  const legalCase = unwrap(
-    await supabase
-      .from("cases")
-      .select(
-        "*, clients(name, type), case_parties(*), case_notes(body, created_at), case_events(*)",
-      )
-      .eq("id", caseId)
-      .single(),
-  );
+export async function getCaseContext(db: AppDb, orgId: string, caseId: string) {
+  const [legalCase] = await db
+    .select()
+    .from(cases)
+    .where(and(eq(cases.id, caseId), eq(cases.orgId, orgId)))
+    .limit(1);
+  if (!legalCase) throw errors.notFound("Case not found");
 
-  return legalCase;
+  const [client, parties, notes, events] = await Promise.all([
+    legalCase.clientId
+      ? db.select().from(clients).where(eq(clients.id, legalCase.clientId)).limit(1)
+      : Promise.resolve([]),
+    db.select().from(caseParties).where(eq(caseParties.caseId, caseId)),
+    db.select().from(caseNotes).where(eq(caseNotes.caseId, caseId)),
+    db.select().from(caseEvents).where(eq(caseEvents.caseId, caseId)),
+  ]);
+
+  return {
+    ...legalCase,
+    client: client[0] ?? null,
+    parties,
+    notes,
+    events,
+  };
 }

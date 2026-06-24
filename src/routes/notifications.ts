@@ -1,76 +1,92 @@
+import { and, desc, eq, isNull } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { getCurrentMembership, unwrap } from "../utils/supabase.js";
+import { notifications } from "../db/schema.js";
+import { getRequestMembership } from "../utils/db.js";
+import { errors } from "../utils/errors.js";
+import { data } from "../utils/serialize.js";
 import { paginationSchema, parseBody, parseParams, parseQuery } from "../utils/validation.js";
 
 export async function registerNotificationRoutes(app: FastifyInstance) {
   app.get("/v1/notifications", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const query = parseQuery(
       request,
-      z.object({
-        unreadOnly: z.coerce.boolean().default(false),
-        ...paginationSchema,
-      }),
+      z.object({ unread: z.coerce.boolean().optional(), ...paginationSchema }),
     );
+    const filters = [
+      eq(notifications.orgId, membership.orgId),
+      eq(notifications.userId, request.auth!.userId),
+    ];
+    if (query.unread) filters.push(isNull(notifications.readAt));
 
-    await getCurrentMembership(request.supabase!, request.auth!.userId);
-    let builder = request
-      .supabase!.from("notifications")
-      .select("*")
-      .eq("user_id", request.auth!.userId)
-      .order("created_at", { ascending: false })
-      .range(query.offset, query.offset + query.limit - 1);
-    if (query.unreadOnly) builder = builder.is("read_at", null);
-
-    return { data: unwrap(await builder) };
+    const rows = await app.db
+      .select()
+      .from(notifications)
+      .where(and(...filters))
+      .orderBy(desc(notifications.createdAt))
+      .limit(query.limit)
+      .offset(query.offset);
+    return data(rows);
   });
 
   app.post("/v1/notifications/:id/read", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const notification = unwrap(
-      await request
-        .supabase!.from("notifications")
-        .update({ read_at: new Date().toISOString() })
-        .eq("id", id)
-        .eq("user_id", request.auth!.userId)
-        .select("*")
-        .single(),
-    );
-    return { data: notification };
+    const [notification] = await app.db
+      .update(notifications)
+      .set({ readAt: new Date() })
+      .where(
+        and(
+          eq(notifications.id, id),
+          eq(notifications.orgId, membership.orgId),
+          eq(notifications.userId, request.auth!.userId),
+        ),
+      )
+      .returning();
+    if (!notification) throw errors.notFound("Notification not found");
+    return data(notification);
   });
 
   app.post("/v1/notifications/read-all", { preHandler: app.requireAuth }, async (request) => {
-    const notifications = unwrap(
-      await request
-        .supabase!.from("notifications")
-        .update({ read_at: new Date().toISOString() })
-        .eq("user_id", request.auth!.userId)
-        .is("read_at", null)
-        .select("*"),
-    );
-    return { data: notifications };
+    const { membership } = await getRequestMembership(app.db, request);
+    const rows = await app.db
+      .update(notifications)
+      .set({ readAt: new Date() })
+      .where(
+        and(
+          eq(notifications.orgId, membership.orgId),
+          eq(notifications.userId, request.auth!.userId),
+          isNull(notifications.readAt),
+        ),
+      )
+      .returning({ id: notifications.id });
+    return data({ updated: rows.length });
   });
 
   app.post("/v1/notifications", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const body = parseBody(
       request,
       z.object({
         user_id: z.string().uuid(),
-        kind: z.string().min(1),
         title: z.string().min(1),
         body: z.string().min(1),
-        link: z.string().optional(),
-        scheduled_at: z.string().datetime().optional(),
+        kind: z.string().default("info"),
+        metadata: z.record(z.unknown()).optional(),
       }),
     );
-    const notification = unwrap(
-      await request
-        .supabase!.from("notifications")
-        .insert({ ...body, org_id: membership.org_id })
-        .select("*")
-        .single(),
-    );
-    return { data: notification };
+    const [notification] = await app.db
+      .insert(notifications)
+      .values({
+        orgId: membership.orgId,
+        userId: body.user_id,
+        title: body.title,
+        body: body.body,
+        kind: body.kind,
+        metadata: body.metadata ?? {},
+      })
+      .returning();
+    return data(notification);
   });
 }

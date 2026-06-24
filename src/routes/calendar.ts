@@ -1,176 +1,206 @@
+import { and, desc, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { getCurrentMembership, insertActivity, unwrap } from "../utils/supabase.js";
+import { appointments, deadlines, notifications } from "../db/schema.js";
+import { getRequestMembership, insertActivity } from "../utils/db.js";
+import { errors } from "../utils/errors.js";
+import { data } from "../utils/serialize.js";
 import { paginationSchema, parseBody, parseParams, parseQuery } from "../utils/validation.js";
-
-const appointmentSchema = z.object({
-  title: z.string().min(1).max(200),
-  kind: z.enum(["hearing", "meeting", "call", "task", "other"]).default("meeting"),
-  starts_at: z.string().datetime(),
-  ends_at: z.string().datetime().optional(),
-  owner_id: z.string().uuid().optional(),
-  case_id: z.string().uuid().optional(),
-  location: z.string().optional(),
-  notes: z.string().optional(),
-});
-
-const deadlineSchema = z.object({
-  title: z.string().min(1).max(200),
-  due_at: z.string().datetime(),
-  case_id: z.string().uuid().optional(),
-  kind: z.string().min(1),
-  priority: z.enum(["low", "normal", "high", "critical"]).default("normal"),
-  assignee_id: z.string().uuid().optional(),
-  reminder_offsets: z.array(z.number().int()).default([]),
-});
 
 export async function registerCalendarRoutes(app: FastifyInstance) {
   app.get("/v1/appointments", { preHandler: app.requireAuth }, async (request) => {
-    const query = parseQuery(
-      request,
-      z.object({
-        from: z.string().datetime(),
-        to: z.string().datetime(),
-        ownerId: z.string().uuid().optional(),
-        caseId: z.string().uuid().optional(),
-      }),
-    );
-
-    let builder = request
-      .supabase!.from("appointments")
-      .select("*")
-      .gte("starts_at", query.from)
-      .lte("starts_at", query.to)
-      .order("starts_at", { ascending: true });
-
-    if (query.ownerId) builder = builder.eq("owner_id", query.ownerId);
-    if (query.caseId) builder = builder.eq("case_id", query.caseId);
-    return { data: unwrap(await builder) };
+    const { membership } = await getRequestMembership(app.db, request);
+    const query = parseQuery(request, z.object({ ...paginationSchema }));
+    const rows = await app.db
+      .select()
+      .from(appointments)
+      .where(eq(appointments.orgId, membership.orgId))
+      .orderBy(desc(appointments.startsAt))
+      .limit(query.limit)
+      .offset(query.offset);
+    return data(rows);
   });
 
   app.post("/v1/appointments", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
-    const body = parseBody(request, appointmentSchema);
-    const appointment = unwrap(
-      await request
-        .supabase!.from("appointments")
-        .insert({
-          ...body,
-          org_id: membership.org_id,
-          owner_id: body.owner_id ?? request.auth!.userId,
-        })
-        .select("*")
-        .single(),
+    const { membership } = await getRequestMembership(app.db, request);
+    const body = parseBody(
+      request,
+      z.object({
+        title: z.string().min(1),
+        starts_at: z.string().datetime(),
+        ends_at: z.string().datetime().optional(),
+        case_id: z.string().uuid().optional(),
+        client_id: z.string().uuid().optional(),
+        owner_id: z.string().uuid().optional(),
+        location: z.string().optional(),
+        notes: z.string().optional(),
+        metadata: z.record(z.unknown()).optional(),
+      }),
     );
+    const [appointment] = await app.db
+      .insert(appointments)
+      .values({
+        orgId: membership.orgId,
+        title: body.title,
+        startsAt: new Date(body.starts_at),
+        endsAt: body.ends_at ? new Date(body.ends_at) : undefined,
+        caseId: body.case_id,
+        clientId: body.client_id,
+        ownerId: body.owner_id ?? request.auth!.userId,
+        location: body.location,
+        notes: body.notes,
+        metadata: body.metadata ?? {},
+      })
+      .returning();
 
-    await insertActivity(request.supabase!, {
-      org_id: membership.org_id,
-      user_id: request.auth!.userId,
-      entity_type: "appointment",
-      entity_id: (appointment as any).id,
+    await insertActivity(app.db, {
+      orgId: membership.orgId,
+      userId: request.auth!.userId,
+      entityType: "appointment",
+      entityId: appointment?.id,
       action: "created",
     });
 
-    return { data: appointment };
+    return data(appointment);
   });
 
   app.patch("/v1/appointments/:id", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const patch = parseBody(request, appointmentSchema.partial());
-    const appointment = unwrap(
-      await request.supabase!.from("appointments").update(patch).eq("id", id).select("*").single(),
+    const body = parseBody(
+      request,
+      z.object({
+        title: z.string().min(1).optional(),
+        starts_at: z.string().datetime().optional(),
+        ends_at: z.string().datetime().optional(),
+        location: z.string().optional(),
+        notes: z.string().optional(),
+        metadata: z.record(z.unknown()).optional(),
+      }),
     );
-    return { data: appointment };
+    const [appointment] = await app.db
+      .update(appointments)
+      .set({
+        title: body.title,
+        startsAt: body.starts_at ? new Date(body.starts_at) : undefined,
+        endsAt: body.ends_at ? new Date(body.ends_at) : undefined,
+        location: body.location,
+        notes: body.notes,
+        metadata: body.metadata,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(appointments.id, id), eq(appointments.orgId, membership.orgId)))
+      .returning();
+    if (!appointment) throw errors.notFound("Appointment not found");
+    return data(appointment);
   });
 
   app.delete("/v1/appointments/:id", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const appointment = unwrap(
-      await request.supabase!.from("appointments").delete().eq("id", id).select("*").single(),
-    );
-    return { data: appointment };
+    const [appointment] = await app.db
+      .delete(appointments)
+      .where(and(eq(appointments.id, id), eq(appointments.orgId, membership.orgId)))
+      .returning();
+    if (!appointment) throw errors.notFound("Appointment not found");
+    return data(appointment);
   });
 
   app.get("/v1/deadlines", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const query = parseQuery(
       request,
-      z.object({
-        caseId: z.string().uuid().optional(),
-        status: z.string().optional(),
-        from: z.string().datetime().optional(),
-        to: z.string().datetime().optional(),
-        ...paginationSchema,
-      }),
+      z.object({ status: z.string().optional(), ...paginationSchema }),
     );
-
-    let builder = request
-      .supabase!.from("deadlines")
-      .select("*")
-      .order("due_at", { ascending: true })
-      .range(query.offset, query.offset + query.limit - 1);
-
-    if (query.caseId) builder = builder.eq("case_id", query.caseId);
-    if (query.status) builder = builder.eq("status", query.status);
-    if (query.from) builder = builder.gte("due_at", query.from);
-    if (query.to) builder = builder.lte("due_at", query.to);
-
-    return { data: unwrap(await builder) };
+    const filters = [eq(deadlines.orgId, membership.orgId)];
+    if (query.status) filters.push(eq(deadlines.status, query.status));
+    const rows = await app.db
+      .select()
+      .from(deadlines)
+      .where(and(...filters))
+      .orderBy(desc(deadlines.dueAt))
+      .limit(query.limit)
+      .offset(query.offset);
+    return data(rows);
   });
 
   app.post("/v1/deadlines", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
-    const body = parseBody(request, deadlineSchema);
-    const deadline = unwrap(
-      await request
-        .supabase!.from("deadlines")
-        .insert({
-          ...body,
-          org_id: membership.org_id,
-          assignee_id: body.assignee_id ?? request.auth!.userId,
-          status: "open",
-        })
-        .select("*")
-        .single(),
-    ) as any;
-
-    for (const offset of body.reminder_offsets) {
-      const scheduledAt = new Date(new Date(body.due_at).getTime() - offset * 60_000);
-      await request.supabase!.from("notifications").insert({
-        org_id: membership.org_id,
-        user_id: body.assignee_id ?? request.auth!.userId,
-        kind: "deadline_reminder",
+    const { membership } = await getRequestMembership(app.db, request);
+    const body = parseBody(
+      request,
+      z.object({
+        title: z.string().min(1),
+        due_at: z.string().datetime(),
+        case_id: z.string().uuid().optional(),
+        assignee_id: z.string().uuid().optional(),
+        priority: z.string().default("normal"),
+        metadata: z.record(z.unknown()).optional(),
+      }),
+    );
+    const assigneeId = body.assignee_id ?? request.auth!.userId;
+    const [deadline] = await app.db
+      .insert(deadlines)
+      .values({
+        orgId: membership.orgId,
         title: body.title,
-        body: `Reminder for deadline due at ${body.due_at}`,
-        link: `/deadlines/${deadline.id}`,
-        scheduled_at: scheduledAt.toISOString(),
-      });
-    }
+        dueAt: new Date(body.due_at),
+        caseId: body.case_id,
+        assigneeId,
+        priority: body.priority,
+        metadata: body.metadata ?? {},
+      })
+      .returning();
 
-    return { data: deadline };
+    await app.db.insert(notifications).values({
+      orgId: membership.orgId,
+      userId: assigneeId,
+      title: "New deadline",
+      body: body.title,
+      kind: "deadline",
+      metadata: { deadline_id: deadline?.id },
+    });
+
+    return data(deadline);
   });
 
   app.patch("/v1/deadlines/:id", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const patch = parseBody(
+    const body = parseBody(
       request,
-      deadlineSchema.partial().extend({ status: z.string().optional() }),
+      z.object({
+        title: z.string().min(1).optional(),
+        due_at: z.string().datetime().optional(),
+        status: z.string().optional(),
+        priority: z.string().optional(),
+        metadata: z.record(z.unknown()).optional(),
+      }),
     );
-    const deadline = unwrap(
-      await request.supabase!.from("deadlines").update(patch).eq("id", id).select("*").single(),
-    );
-    return { data: deadline };
+    const [deadline] = await app.db
+      .update(deadlines)
+      .set({
+        title: body.title,
+        dueAt: body.due_at ? new Date(body.due_at) : undefined,
+        status: body.status,
+        priority: body.priority,
+        metadata: body.metadata,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(deadlines.id, id), eq(deadlines.orgId, membership.orgId)))
+      .returning();
+    if (!deadline) throw errors.notFound("Deadline not found");
+    return data(deadline);
   });
 
   app.post("/v1/deadlines/:id/complete", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const deadline = unwrap(
-      await request
-        .supabase!.from("deadlines")
-        .update({ status: "completed", completed_at: new Date().toISOString() })
-        .eq("id", id)
-        .select("*")
-        .single(),
-    );
-    return { data: deadline };
+    const [deadline] = await app.db
+      .update(deadlines)
+      .set({ status: "completed", completedAt: new Date(), updatedAt: new Date() })
+      .where(and(eq(deadlines.id, id), eq(deadlines.orgId, membership.orgId)))
+      .returning();
+    if (!deadline) throw errors.notFound("Deadline not found");
+    return data(deadline);
   });
 }

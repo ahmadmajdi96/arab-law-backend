@@ -1,135 +1,151 @@
+import { and, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { SignJWT } from "jose";
 import { nanoid } from "nanoid";
 import { z } from "zod";
 import { env } from "../config/env.js";
-import { getCurrentMembership, unwrap } from "../utils/supabase.js";
+import { liveSessions, meetings } from "../db/schema.js";
+import { getRequestMembership } from "../utils/db.js";
+import { errors } from "../utils/errors.js";
+import { data } from "../utils/serialize.js";
 import { parseBody, parseParams } from "../utils/validation.js";
 
-async function mintMeetingToken(payload: Record<string, unknown>) {
-  return new SignJWT(payload)
-    .setProtectedHeader({ alg: "HS256" })
+async function meetingToken(input: {
+  room: string;
+  userId: string;
+  orgId: string;
+  role?: string | undefined;
+}) {
+  return new SignJWT({
+    room: input.room,
+    org_id: input.orgId,
+    role: input.role ?? "participant",
+  })
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setSubject(input.userId)
     .setIssuedAt()
-    .setExpirationTime("6h")
+    .setExpirationTime("2h")
     .sign(new TextEncoder().encode(env.MEETING_TOKEN_SECRET));
 }
 
 export async function registerMeetingRoutes(app: FastifyInstance) {
   app.post("/v1/meetings", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const body = parseBody(
       request,
       z.object({
-        title: z.string().min(1).max(200),
-        scheduled_at: z.string().datetime(),
-        attendees: z.array(z.string().uuid()).default([]),
+        title: z.string().min(1),
         case_id: z.string().uuid().optional(),
+        starts_at: z.string().datetime().optional(),
+        metadata: z.record(z.unknown()).optional(),
       }),
     );
+    const room = `room_${nanoid(18)}`;
+    const [meeting] = await app.db
+      .insert(meetings)
+      .values({
+        orgId: membership.orgId,
+        caseId: body.case_id,
+        room,
+        title: body.title,
+        startsAt: body.starts_at ? new Date(body.starts_at) : new Date(),
+        hostUserId: request.auth!.userId,
+        createdBy: request.auth!.userId,
+        metadata: body.metadata ?? {},
+      })
+      .returning();
 
-    const room = nanoid(24);
-    const token = await mintMeetingToken({
-      org_id: membership.org_id,
-      room,
-      host_user_id: request.auth!.userId,
-      attendees: body.attendees,
+    return data({
+      meeting,
+      token: await meetingToken({
+        room,
+        userId: request.auth!.userId,
+        orgId: membership.orgId,
+        role: "host",
+      }),
     });
-
-    const meeting = unwrap(
-      await request
-        .supabase!.from("meetings")
-        .insert({
-          ...body,
-          org_id: membership.org_id,
-          room,
-          room_token: token,
-          created_by: request.auth!.userId,
-          status: "scheduled",
-        })
-        .select("*")
-        .single(),
-    );
-
-    return { data: { ...(meeting as unknown as Record<string, unknown>), room_token: token } };
   });
 
   app.post("/v1/meetings/:room/join", { preHandler: app.requireAuth }, async (request) => {
-    const { room } = parseParams(request, z.object({ room: z.string().min(8) }));
-    const meeting = unwrap(
-      await request.supabase!.from("meetings").select("*").eq("room", room).single(),
-    ) as any;
-    const token = await mintMeetingToken({
-      org_id: meeting.org_id,
-      room,
-      user_id: request.auth!.userId,
-    });
+    const { membership } = await getRequestMembership(app.db, request);
+    const { room } = parseParams(request, z.object({ room: z.string().min(1) }));
+    const [meeting] = await app.db
+      .select()
+      .from(meetings)
+      .where(and(eq(meetings.room, room), eq(meetings.orgId, membership.orgId)))
+      .limit(1);
+    if (!meeting) throw errors.notFound("Meeting not found");
 
-    return { data: { meeting, room_token: token } };
+    return data({
+      meeting,
+      token: await meetingToken({
+        room,
+        userId: request.auth!.userId,
+        orgId: membership.orgId,
+      }),
+    });
   });
 
   app.post("/v1/meetings/:id/end", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const meeting = unwrap(
-      await request
-        .supabase!.from("meetings")
-        .update({ status: "ended", ended_at: new Date().toISOString() })
-        .eq("id", id)
-        .select("*")
-        .single(),
-    );
-    return { data: meeting };
+    const [meeting] = await app.db
+      .update(meetings)
+      .set({ status: "ended", endedAt: new Date(), updatedAt: new Date() })
+      .where(and(eq(meetings.id, id), eq(meetings.orgId, membership.orgId)))
+      .returning();
+    if (!meeting) throw errors.notFound("Meeting not found");
+    return data(meeting);
   });
 
   app.post("/v1/live-sessions", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const body = parseBody(
       request,
       z.object({
-        case_id: z.string().uuid().optional(),
         title: z.string().min(1),
+        case_id: z.string().uuid().optional(),
       }),
     );
-    const session = unwrap(
-      await request
-        .supabase!.from("live_sessions")
-        .insert({
-          ...body,
-          org_id: membership.org_id,
-          created_by: request.auth!.userId,
-          transcript: [],
-        })
-        .select("*")
-        .single(),
-    );
-    return { data: session };
+    const [session] = await app.db
+      .insert(liveSessions)
+      .values({
+        orgId: membership.orgId,
+        caseId: body.case_id,
+        title: body.title,
+        createdBy: request.auth!.userId,
+      })
+      .returning();
+    return data(session);
   });
 
   app.post("/v1/live-sessions/:id/transcript", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
     const body = parseBody(
       request,
       z.object({
-        chunk: z.string().min(1),
-        speaker: z.string().optional(),
+        speaker: z.string().min(1),
+        text: z.string().min(1),
+        at: z.string().datetime().optional(),
       }),
     );
-    const session = unwrap(
-      await request.supabase!.from("live_sessions").select("*").eq("id", id).single(),
-    ) as any;
-    const transcript = Array.isArray(session.transcript) ? session.transcript : [];
-    const updated = unwrap(
-      await request
-        .supabase!.from("live_sessions")
-        .update({
-          transcript: [
-            ...transcript,
-            { ...body, at: new Date().toISOString(), user_id: request.auth!.userId },
-          ],
-        })
-        .eq("id", id)
-        .select("*")
-        .single(),
-    );
-    return { data: updated };
+    const [session] = await app.db
+      .select()
+      .from(liveSessions)
+      .where(and(eq(liveSessions.id, id), eq(liveSessions.orgId, membership.orgId)))
+      .limit(1);
+    if (!session) throw errors.notFound("Live session not found");
+
+    const transcript = [
+      ...(session.transcript ?? []),
+      { ...body, at: body.at ?? new Date().toISOString(), user_id: request.auth!.userId },
+    ];
+    const [updated] = await app.db
+      .update(liveSessions)
+      .set({ transcript, updatedAt: new Date() })
+      .where(eq(liveSessions.id, id))
+      .returning();
+    return data(updated);
   });
 }

@@ -10,8 +10,9 @@ import Fastify from "fastify";
 import rawBody from "fastify-raw-body";
 import { env } from "./config/env.js";
 import { authPlugin } from "./plugins/auth.js";
+import { databasePlugin } from "./plugins/database.js";
 import { observabilityPlugin } from "./plugins/observability.js";
-import { supabasePlugin } from "./plugins/supabase.js";
+import { storagePlugin } from "./plugins/storage.js";
 import { registerRoutes } from "./routes/index.js";
 import { errorHandler } from "./utils/errors.js";
 
@@ -22,8 +23,9 @@ export async function buildApp() {
       redact: [
         "req.headers.authorization",
         "req.headers.cookie",
-        "SUPABASE_SERVICE_ROLE_KEY",
         "NOVITA_API_KEY",
+        "JWT_SECRET",
+        "S3_SECRET_ACCESS_KEY",
       ],
     },
     trustProxy: true,
@@ -64,7 +66,7 @@ export async function buildApp() {
         title: "arab.law Backend API",
         version: "1.0.0",
         description:
-          "Production API layer for Supabase RLS, legal practice workflows, AI tasks, billing, and observability.",
+          "Production-owned API layer for legal practice workflows, auth, storage, AI tasks, billing, and observability.",
       },
       servers: [{ url: env.API_PUBLIC_URL ?? "http://localhost:3000" }],
       components: {
@@ -72,7 +74,7 @@ export async function buildApp() {
           bearerAuth: {
             type: "http",
             scheme: "bearer",
-            bearerFormat: "Supabase JWT",
+            bearerFormat: "arab.law access JWT",
           },
         },
       },
@@ -83,7 +85,8 @@ export async function buildApp() {
   });
 
   await app.register(observabilityPlugin);
-  await app.register(supabasePlugin);
+  await app.register(databasePlugin);
+  await app.register(storagePlugin);
   await app.register(authPlugin);
   await registerRoutes(app);
 

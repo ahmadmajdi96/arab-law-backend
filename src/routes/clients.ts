@@ -1,151 +1,173 @@
+import { and, desc, eq, ilike, or } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { getCurrentMembership, insertActivity, unwrap } from "../utils/supabase.js";
+import { clientInteractions, clients } from "../db/schema.js";
+import { getRequestMembership, insertActivity } from "../utils/db.js";
+import { errors } from "../utils/errors.js";
+import { data } from "../utils/serialize.js";
 import { paginationSchema, parseBody, parseParams, parseQuery } from "../utils/validation.js";
 
-const clientBodySchema = z.object({
-  name: z.string().min(2).max(200),
-  type: z.enum(["individual", "company"]),
+const clientBody = z.object({
+  name: z.string().min(1).max(240),
+  type: z.string().default("individual"),
   email: z.string().email().optional(),
-  phone: z.string().max(50).optional(),
-  national_id: z.string().max(100).optional(),
-  address: z.string().max(500).optional(),
-  tags: z.array(z.string()).default([]),
+  phone: z.string().optional(),
+  national_id: z.string().optional(),
+  address: z.string().optional(),
   notes: z.string().optional(),
   owner_id: z.string().uuid().optional(),
+  metadata: z.record(z.unknown()).optional(),
 });
 
 export async function registerClientRoutes(app: FastifyInstance) {
   app.get("/v1/clients", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const query = parseQuery(
       request,
       z.object({
         q: z.string().optional(),
-        type: z.enum(["individual", "company"]).optional(),
-        tag: z.string().optional(),
         ...paginationSchema,
       }),
     );
 
-    let builder = request
-      .supabase!.from("clients")
-      .select("*")
-      .is("deleted_at", null)
-      .order("created_at", { ascending: false })
-      .range(query.offset, query.offset + query.limit - 1);
+    const filters = [eq(clients.orgId, membership.orgId)];
+    if (query.q) {
+      filters.push(or(ilike(clients.name, `%${query.q}%`), ilike(clients.email, `%${query.q}%`))!);
+    }
 
-    if (query.q) builder = builder.ilike("name", `%${query.q}%`);
-    if (query.type) builder = builder.eq("type", query.type);
-    if (query.tag) builder = builder.contains("tags", [query.tag]);
+    const rows = await app.db
+      .select()
+      .from(clients)
+      .where(and(...filters))
+      .orderBy(desc(clients.createdAt))
+      .limit(query.limit)
+      .offset(query.offset);
 
-    return { data: unwrap(await builder) };
+    return data(rows);
   });
 
   app.get("/v1/clients/:id", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const client = unwrap(
-      await request
-        .supabase!.from("clients")
-        .select("*, client_interactions(*), cases(id, title, status, opened_at)")
-        .eq("id", id)
-        .single(),
-    );
-    return { data: client };
+    const [client] = await app.db
+      .select()
+      .from(clients)
+      .where(and(eq(clients.id, id), eq(clients.orgId, membership.orgId)))
+      .limit(1);
+    if (!client) throw errors.notFound("Client not found");
+    return data(client);
   });
 
   app.post("/v1/clients", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
-    const body = parseBody(request, clientBodySchema);
-    const client = unwrap(
-      await request
-        .supabase!.from("clients")
-        .insert({
-          ...body,
-          org_id: membership.org_id,
-          owner_id: body.owner_id ?? request.auth!.userId,
-        })
-        .select("*")
-        .single(),
-    );
+    const { membership } = await getRequestMembership(app.db, request);
+    const body = parseBody(request, clientBody);
+    const [client] = await app.db
+      .insert(clients)
+      .values({
+        orgId: membership.orgId,
+        ownerId: body.owner_id ?? request.auth!.userId,
+        name: body.name,
+        type: body.type,
+        email: body.email,
+        phone: body.phone,
+        nationalId: body.national_id,
+        address: body.address,
+        notes: body.notes,
+        metadata: body.metadata ?? {},
+      })
+      .returning();
+    if (!client) throw errors.unavailable("Unable to create client");
 
-    await insertActivity(request.supabase!, {
-      org_id: membership.org_id,
-      user_id: request.auth!.userId,
-      entity_type: "client",
-      entity_id: (client as any).id,
+    await insertActivity(app.db, {
+      orgId: membership.orgId,
+      userId: request.auth!.userId,
+      entityType: "client",
+      entityId: client.id,
       action: "created",
     });
 
-    return { data: client };
+    return data(client);
   });
 
   app.patch("/v1/clients/:id", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const patch = parseBody(request, clientBodySchema.partial());
-    const client = unwrap(
-      await request.supabase!.from("clients").update(patch).eq("id", id).select("*").single(),
-    );
+    const body = parseBody(request, clientBody.partial());
+    const [client] = await app.db
+      .update(clients)
+      .set({
+        name: body.name,
+        type: body.type,
+        email: body.email,
+        phone: body.phone,
+        nationalId: body.national_id,
+        address: body.address,
+        notes: body.notes,
+        ownerId: body.owner_id,
+        metadata: body.metadata,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(clients.id, id), eq(clients.orgId, membership.orgId)))
+      .returning();
+    if (!client) throw errors.notFound("Client not found");
 
-    await insertActivity(request.supabase!, {
-      org_id: membership.org_id,
-      user_id: request.auth!.userId,
-      entity_type: "client",
-      entity_id: id,
+    await insertActivity(app.db, {
+      orgId: membership.orgId,
+      userId: request.auth!.userId,
+      entityType: "client",
+      entityId: id,
       action: "updated",
-      meta: { fields: Object.keys(patch) },
     });
 
-    return { data: client };
+    return data(client);
   });
 
   app.delete("/v1/clients/:id", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const client = unwrap(
-      await request
-        .supabase!.from("clients")
-        .update({ deleted_at: new Date().toISOString() })
-        .eq("id", id)
-        .select("*")
-        .single(),
-    );
+    const [client] = await app.db
+      .delete(clients)
+      .where(and(eq(clients.id, id), eq(clients.orgId, membership.orgId)))
+      .returning();
+    if (!client) throw errors.notFound("Client not found");
 
-    await insertActivity(request.supabase!, {
-      org_id: membership.org_id,
-      user_id: request.auth!.userId,
-      entity_type: "client",
-      entity_id: id,
+    await insertActivity(app.db, {
+      orgId: membership.orgId,
+      userId: request.auth!.userId,
+      entityType: "client",
+      entityId: id,
       action: "deleted",
     });
 
-    return { data: client };
+    return data(client);
   });
 
   app.post("/v1/clients/:id/interactions", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
     const body = parseBody(
       request,
       z.object({
-        kind: z.enum(["call", "email", "meeting", "note"]),
-        body: z.string().min(1),
+        channel: z.string().default("note"),
+        summary: z.string().min(1),
         occurred_at: z.string().datetime().optional(),
+        metadata: z.record(z.unknown()).optional(),
       }),
     );
-    const interaction = unwrap(
-      await request
-        .supabase!.from("client_interactions")
-        .insert({
-          ...body,
-          client_id: id,
-          org_id: membership.org_id,
-          user_id: request.auth!.userId,
-        })
-        .select("*")
-        .single(),
-    );
 
-    return { data: interaction };
+    const [interaction] = await app.db
+      .insert(clientInteractions)
+      .values({
+        orgId: membership.orgId,
+        clientId: id,
+        userId: request.auth!.userId,
+        channel: body.channel,
+        summary: body.summary,
+        occurredAt: body.occurred_at ? new Date(body.occurred_at) : new Date(),
+        metadata: body.metadata ?? {},
+      })
+      .returning();
+    if (!interaction) throw errors.unavailable("Unable to create interaction");
+    return data(interaction);
   });
 }

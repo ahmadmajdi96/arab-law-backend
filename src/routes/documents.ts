@@ -1,7 +1,11 @@
+import { and, desc, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { nanoid } from "nanoid";
 import { z } from "zod";
-import { getCurrentMembership, insertActivity, unwrap } from "../utils/supabase.js";
+import { documentShares, documentVersions, documents } from "../db/schema.js";
+import { getRequestMembership, insertActivity } from "../utils/db.js";
+import { errors } from "../utils/errors.js";
+import { data } from "../utils/serialize.js";
 import { paginationSchema, parseBody, parseParams, parseQuery } from "../utils/validation.js";
 
 const documentBodySchema = z.object({
@@ -11,11 +15,13 @@ const documentBodySchema = z.object({
   mime: z.string().min(1),
   size: z.number().int().nonnegative(),
   storage_path: z.string().min(1),
-  kind: z.string().optional(),
+  kind: z.string().default("file"),
+  metadata: z.record(z.unknown()).optional(),
 });
 
 export async function registerDocumentRoutes(app: FastifyInstance) {
   app.get("/v1/documents", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const query = parseQuery(
       request,
       z.object({
@@ -25,56 +31,65 @@ export async function registerDocumentRoutes(app: FastifyInstance) {
       }),
     );
 
-    let builder = request
-      .supabase!.from("documents")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .range(query.offset, query.offset + query.limit - 1);
+    const filters = [eq(documents.orgId, membership.orgId)];
+    if (query.caseId) filters.push(eq(documents.caseId, query.caseId));
+    if (query.clientId) filters.push(eq(documents.clientId, query.clientId));
 
-    if (query.caseId) builder = builder.eq("case_id", query.caseId);
-    if (query.clientId) builder = builder.eq("client_id", query.clientId);
+    const rows = await app.db
+      .select()
+      .from(documents)
+      .where(and(...filters))
+      .orderBy(desc(documents.createdAt))
+      .limit(query.limit)
+      .offset(query.offset);
 
-    const documents = unwrap(await builder) as any[];
-    const data = await Promise.all(
-      documents.map(async (document) => {
-        const { data } = await request
-          .supabase!.storage.from("documents")
-          .createSignedUrl(document.storage_path, 3600);
-        return { ...document, signed_url: data?.signedUrl };
-      }),
+    const withUrls = await Promise.all(
+      rows.map(async (document) => ({
+        ...document,
+        signedUrl: await app.storage.signedDownloadUrl({
+          key: document.storagePath,
+          filename: document.name,
+          expiresIn: 3600,
+        }),
+      })),
     );
 
-    return { data };
+    return data(withUrls);
   });
 
   app.post("/v1/documents", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const body = parseBody(request, documentBodySchema);
-    const document = unwrap(
-      await request
-        .supabase!.from("documents")
-        .insert({
-          ...body,
-          org_id: membership.org_id,
-          uploaded_by: request.auth!.userId,
-        })
-        .select("*")
-        .single(),
-    );
+    const [document] = await app.db
+      .insert(documents)
+      .values({
+        orgId: membership.orgId,
+        name: body.name,
+        caseId: body.case_id,
+        clientId: body.client_id,
+        mime: body.mime,
+        size: body.size,
+        storagePath: body.storage_path,
+        kind: body.kind,
+        uploadedBy: request.auth!.userId,
+        metadata: body.metadata ?? {},
+      })
+      .returning();
+    if (!document) throw errors.unavailable("Unable to create document");
 
-    await insertActivity(request.supabase!, {
-      org_id: membership.org_id,
-      user_id: request.auth!.userId,
-      entity_type: "document",
-      entity_id: (document as any).id,
+    await insertActivity(app.db, {
+      orgId: membership.orgId,
+      userId: request.auth!.userId,
+      entityType: "document",
+      entityId: document.id,
       action: "created",
     });
 
-    return { data: document };
+    return data(document);
   });
 
   app.post("/v1/documents/upload-url", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const body = parseBody(
       request,
       z.object({
@@ -85,80 +100,82 @@ export async function registerDocumentRoutes(app: FastifyInstance) {
     );
 
     const extension = body.filename.includes(".") ? body.filename.split(".").pop() : "bin";
-    const storagePath = `${membership.org_id}/${body.case_id ?? "general"}/${nanoid(24)}.${extension}`;
-    const signed = await request
-      .supabase!.storage.from("documents")
-      .createSignedUploadUrl(storagePath);
+    const storagePath = `${membership.orgId}/${body.case_id ?? "general"}/${nanoid(24)}.${extension}`;
+    const signedUrl = await app.storage.signedUploadUrl({
+      key: storagePath,
+      contentType: body.content_type,
+      expiresIn: 900,
+    });
 
-    if (signed.error) throw signed.error;
-
-    return {
-      data: {
-        storage_path: storagePath,
-        token: signed.data.token,
-        signed_url: signed.data.signedUrl,
-        path: signed.data.path,
-      },
-    };
+    return data({
+      storagePath,
+      signedUrl,
+      method: "PUT",
+      expiresIn: 900,
+    });
   });
 
   app.post("/v1/documents/:id/signed-url", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
     const body = parseBody(
       request,
       z.object({
         expires: z.number().int().min(60).max(86400).default(3600),
+        download: z.boolean().default(false),
       }),
     );
 
-    const document = unwrap(
-      await request.supabase!.from("documents").select("*").eq("id", id).single(),
-    ) as any;
-    const signed = await request
-      .supabase!.storage.from("documents")
-      .createSignedUrl(document.storage_path, body.expires);
+    const [document] = await app.db
+      .select()
+      .from(documents)
+      .where(and(eq(documents.id, id), eq(documents.orgId, membership.orgId)))
+      .limit(1);
+    if (!document) throw errors.notFound("Document not found");
 
-    if (signed.error) throw signed.error;
-    return { data: { signed_url: signed.data.signedUrl, expires_in: body.expires } };
+    const signedUrl = await app.storage.signedDownloadUrl({
+      key: document.storagePath,
+      filename: document.name,
+      download: body.download,
+      expiresIn: body.expires,
+    });
+    return data({ signedUrl, expiresIn: body.expires });
   });
 
   app.delete("/v1/documents/:id", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const document = unwrap(
-      await request.supabase!.from("documents").select("*").eq("id", id).single(),
-    ) as any;
+    const [document] = await app.db
+      .delete(documents)
+      .where(and(eq(documents.id, id), eq(documents.orgId, membership.orgId)))
+      .returning();
+    if (!document) throw errors.notFound("Document not found");
 
-    await request.supabase!.storage.from("documents").remove([document.storage_path]);
-    const deleted = unwrap(
-      await request.supabase!.from("documents").delete().eq("id", id).select("*").single(),
-    );
-
-    await insertActivity(request.supabase!, {
-      org_id: membership.org_id,
-      user_id: request.auth!.userId,
-      entity_type: "document",
-      entity_id: id,
+    await app.storage.remove(document.storagePath);
+    await insertActivity(app.db, {
+      orgId: membership.orgId,
+      userId: request.auth!.userId,
+      entityType: "document",
+      entityId: id,
       action: "deleted",
     });
 
-    return { data: deleted };
+    return data(document);
   });
 
   app.get("/v1/documents/:id/versions", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const versions = unwrap(
-      await request
-        .supabase!.from("document_versions")
-        .select("*")
-        .eq("document_id", id)
-        .order("created_at", { ascending: false }),
-    );
-    return { data: versions };
+    const versions = await app.db
+      .select()
+      .from(documentVersions)
+      .where(and(eq(documentVersions.documentId, id), eq(documentVersions.orgId, membership.orgId)))
+      .orderBy(desc(documentVersions.createdAt));
+    return data(versions);
   });
 
   app.post("/v1/documents/:id/versions", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
     const body = parseBody(
       request,
@@ -168,23 +185,22 @@ export async function registerDocumentRoutes(app: FastifyInstance) {
         note: z.string().optional(),
       }),
     );
-    const version = unwrap(
-      await request
-        .supabase!.from("document_versions")
-        .insert({
-          ...body,
-          org_id: membership.org_id,
-          document_id: id,
-          created_by: request.auth!.userId,
-        })
-        .select("*")
-        .single(),
-    );
-    return { data: version };
+    const [version] = await app.db
+      .insert(documentVersions)
+      .values({
+        orgId: membership.orgId,
+        documentId: id,
+        storagePath: body.storage_path,
+        size: body.size,
+        note: body.note,
+        createdBy: request.auth!.userId,
+      })
+      .returning();
+    return data(version);
   });
 
   app.post("/v1/documents/:id/shares", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
     const body = parseBody(
       request,
@@ -194,22 +210,18 @@ export async function registerDocumentRoutes(app: FastifyInstance) {
       }),
     );
     const token = nanoid(48);
-    const share = unwrap(
-      await request
-        .supabase!.from("document_shares")
-        .insert({
-          ...body,
-          org_id: membership.org_id,
-          document_id: id,
-          token,
-          created_by: request.auth!.userId,
-        })
-        .select("*")
-        .single(),
-    );
+    const [share] = await app.db
+      .insert(documentShares)
+      .values({
+        orgId: membership.orgId,
+        documentId: id,
+        token,
+        expiresAt: new Date(body.expires_at),
+        allowDownload: body.allow_download,
+        createdBy: request.auth!.userId,
+      })
+      .returning();
 
-    return {
-      data: { ...(share as unknown as Record<string, unknown>), public_url: `/share/${token}` },
-    };
+    return data({ ...share, publicUrl: `/share/${token}` });
   });
 }

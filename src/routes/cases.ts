@@ -1,207 +1,275 @@
+import { and, desc, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { getCurrentMembership, insertActivity, unwrap } from "../utils/supabase.js";
+import { caseEvents, caseMembers, caseNotes, caseParties, cases } from "../db/schema.js";
+import { getRequestMembership, insertActivity } from "../utils/db.js";
+import { errors } from "../utils/errors.js";
+import { data } from "../utils/serialize.js";
 import { paginationSchema, parseBody, parseParams, parseQuery } from "../utils/validation.js";
 
-const caseBodySchema = z.object({
-  title: z.string().min(2).max(240),
-  client_id: z.string().uuid(),
+const caseBody = z.object({
+  client_id: z.string().uuid().optional(),
+  title: z.string().min(1).max(240),
+  case_number: z.string().optional(),
+  type: z.string().default("general"),
+  status: z.string().default("open"),
   court: z.string().optional(),
-  court_number: z.string().optional(),
-  case_type: z.string().optional(),
-  status: z.enum(["open", "pending", "closed", "archived"]).default("open"),
+  judge: z.string().optional(),
+  opponent: z.string().optional(),
   opened_at: z.string().datetime().optional(),
+  closed_at: z.string().datetime().optional(),
   responsible_lawyer: z.string().uuid().optional(),
-  summary: z.string().optional(),
+  metadata: z.record(z.unknown()).optional(),
 });
 
 export async function registerCaseRoutes(app: FastifyInstance) {
   app.get("/v1/cases", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const query = parseQuery(
       request,
       z.object({
         status: z.string().optional(),
         clientId: z.string().uuid().optional(),
-        q: z.string().optional(),
         ...paginationSchema,
       }),
     );
-    let builder = request
-      .supabase!.from("cases")
-      .select("*, clients(id, name, type)")
-      .order("created_at", { ascending: false })
-      .range(query.offset, query.offset + query.limit - 1);
+    const filters = [eq(cases.orgId, membership.orgId)];
+    if (query.status) filters.push(eq(cases.status, query.status));
+    if (query.clientId) filters.push(eq(cases.clientId, query.clientId));
 
-    if (query.status) builder = builder.eq("status", query.status);
-    if (query.clientId) builder = builder.eq("client_id", query.clientId);
-    if (query.q) builder = builder.ilike("title", `%${query.q}%`);
-
-    return { data: unwrap(await builder) };
+    const rows = await app.db
+      .select()
+      .from(cases)
+      .where(and(...filters))
+      .orderBy(desc(cases.createdAt))
+      .limit(query.limit)
+      .offset(query.offset);
+    return data(rows);
   });
 
   app.get("/v1/cases/:id", { preHandler: app.requireAuth }, async (request) => {
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const legalCase = unwrap(
-      await request
-        .supabase!.from("cases")
-        .select(
-          "*, clients(*), case_members(*, profiles(full_name)), case_parties(*), case_notes(*), case_events(*)",
-        )
-        .eq("id", id)
-        .single(),
-    );
-    return { data: legalCase };
+    const [legalCase] = await app.db
+      .select()
+      .from(cases)
+      .where(and(eq(cases.id, id), eq(cases.orgId, membership.orgId)))
+      .limit(1);
+    if (!legalCase) throw errors.notFound("Case not found");
+
+    const [parties, notes, events, members] = await Promise.all([
+      app.db.select().from(caseParties).where(eq(caseParties.caseId, id)),
+      app.db
+        .select()
+        .from(caseNotes)
+        .where(eq(caseNotes.caseId, id))
+        .orderBy(desc(caseNotes.createdAt)),
+      app.db
+        .select()
+        .from(caseEvents)
+        .where(eq(caseEvents.caseId, id))
+        .orderBy(desc(caseEvents.startsAt)),
+      app.db.select().from(caseMembers).where(eq(caseMembers.caseId, id)),
+    ]);
+
+    return data({ ...legalCase, parties, notes, events, members });
   });
 
   app.post("/v1/cases", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
-    const body = parseBody(request, caseBodySchema);
-    const legalCase = unwrap(
-      await request
-        .supabase!.from("cases")
-        .insert({
-          ...body,
-          org_id: membership.org_id,
-          owner_id: request.auth!.userId,
-          responsible_lawyer: body.responsible_lawyer ?? request.auth!.userId,
-        })
-        .select("*")
-        .single(),
-    );
+    const { membership } = await getRequestMembership(app.db, request);
+    const body = parseBody(request, caseBody);
+    const [legalCase] = await app.db
+      .insert(cases)
+      .values({
+        orgId: membership.orgId,
+        clientId: body.client_id,
+        title: body.title,
+        caseNumber: body.case_number,
+        type: body.type,
+        status: body.status,
+        court: body.court,
+        judge: body.judge,
+        opponent: body.opponent,
+        openedAt: body.opened_at ? new Date(body.opened_at) : new Date(),
+        closedAt: body.closed_at ? new Date(body.closed_at) : undefined,
+        ownerId: request.auth!.userId,
+        responsibleLawyer: body.responsible_lawyer ?? request.auth!.userId,
+        metadata: body.metadata ?? {},
+      })
+      .returning();
+    if (!legalCase) throw errors.unavailable("Unable to create case");
 
-    await request.supabase!.from("case_members").insert({
-      org_id: membership.org_id,
-      case_id: (legalCase as any).id,
-      user_id: request.auth!.userId,
-      role: "lead",
+    await app.db.insert(caseMembers).values({
+      orgId: membership.orgId,
+      caseId: legalCase.id,
+      userId: request.auth!.userId,
+      role: "owner",
     });
 
-    await insertActivity(request.supabase!, {
-      org_id: membership.org_id,
-      user_id: request.auth!.userId,
-      entity_type: "case",
-      entity_id: (legalCase as any).id,
+    await insertActivity(app.db, {
+      orgId: membership.orgId,
+      userId: request.auth!.userId,
+      entityType: "case",
+      entityId: legalCase.id,
       action: "created",
     });
 
-    return { data: legalCase };
+    return data(legalCase);
   });
 
   app.patch("/v1/cases/:id", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const patch = parseBody(request, caseBodySchema.partial());
-    const legalCase = unwrap(
-      await request.supabase!.from("cases").update(patch).eq("id", id).select("*").single(),
-    );
+    const body = parseBody(request, caseBody.partial());
+    const [legalCase] = await app.db
+      .update(cases)
+      .set({
+        clientId: body.client_id,
+        title: body.title,
+        caseNumber: body.case_number,
+        type: body.type,
+        status: body.status,
+        court: body.court,
+        judge: body.judge,
+        opponent: body.opponent,
+        openedAt: body.opened_at ? new Date(body.opened_at) : undefined,
+        closedAt: body.closed_at ? new Date(body.closed_at) : undefined,
+        responsibleLawyer: body.responsible_lawyer,
+        metadata: body.metadata,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(cases.id, id), eq(cases.orgId, membership.orgId)))
+      .returning();
+    if (!legalCase) throw errors.notFound("Case not found");
 
-    await insertActivity(request.supabase!, {
-      org_id: membership.org_id,
-      user_id: request.auth!.userId,
-      entity_type: "case",
-      entity_id: id,
+    await insertActivity(app.db, {
+      orgId: membership.orgId,
+      userId: request.auth!.userId,
+      entityType: "case",
+      entityId: id,
       action: "updated",
-      meta: { fields: Object.keys(patch) },
     });
 
-    return { data: legalCase };
+    return data(legalCase);
   });
 
   app.delete("/v1/cases/:id", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const legalCase = unwrap(
-      await request.supabase!.from("cases").delete().eq("id", id).select("*").single(),
-    );
-    await insertActivity(request.supabase!, {
-      org_id: membership.org_id,
-      user_id: request.auth!.userId,
-      entity_type: "case",
-      entity_id: id,
+    const [legalCase] = await app.db
+      .delete(cases)
+      .where(and(eq(cases.id, id), eq(cases.orgId, membership.orgId)))
+      .returning();
+    if (!legalCase) throw errors.notFound("Case not found");
+
+    await insertActivity(app.db, {
+      orgId: membership.orgId,
+      userId: request.auth!.userId,
+      entityType: "case",
+      entityId: id,
       action: "deleted",
     });
-    return { data: legalCase };
+
+    return data(legalCase);
   });
 
   app.post("/v1/cases/:id/parties", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
     const body = parseBody(
       request,
       z.object({
-        role: z.enum(["plaintiff", "defendant", "witness", "expert", "other"]),
         name: z.string().min(1),
-        details: z.record(z.unknown()).optional(),
+        role: z.string().min(1),
+        contact: z.string().optional(),
+        metadata: z.record(z.unknown()).optional(),
       }),
     );
-    const party = unwrap(
-      await request
-        .supabase!.from("case_parties")
-        .insert({ ...body, org_id: membership.org_id, case_id: id })
-        .select("*")
-        .single(),
-    );
-    return { data: party };
+    const [party] = await app.db
+      .insert(caseParties)
+      .values({ orgId: membership.orgId, caseId: id, ...body, metadata: body.metadata ?? {} })
+      .returning();
+    return data(party);
   });
 
   app.post("/v1/cases/:id/notes", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
-    const body = parseBody(request, z.object({ body: z.string().min(1) }));
-    const note = unwrap(
-      await request
-        .supabase!.from("case_notes")
-        .insert({
-          org_id: membership.org_id,
-          case_id: id,
-          body: body.body,
-          user_id: request.auth!.userId,
-        })
-        .select("*")
-        .single(),
+    const body = parseBody(
+      request,
+      z.object({
+        body: z.string().min(1),
+        visibility: z.string().default("internal"),
+      }),
     );
-    return { data: note };
+    const [note] = await app.db
+      .insert(caseNotes)
+      .values({
+        orgId: membership.orgId,
+        caseId: id,
+        userId: request.auth!.userId,
+        body: body.body,
+        visibility: body.visibility,
+      })
+      .returning();
+    return data(note);
   });
 
   app.post("/v1/cases/:id/sessions", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
     const body = parseBody(
       request,
       z.object({
         title: z.string().min(1),
-        scheduled_at: z.string().datetime(),
+        kind: z.string().default("session"),
+        starts_at: z.string().datetime(),
+        ends_at: z.string().datetime().optional(),
         location: z.string().optional(),
-        outcome: z.string().optional(),
+        notes: z.string().optional(),
+        metadata: z.record(z.unknown()).optional(),
       }),
     );
-    const session = unwrap(
-      await request
-        .supabase!.from("case_events")
-        .insert({ ...body, org_id: membership.org_id, case_id: id })
-        .select("*")
-        .single(),
-    );
-    return { data: session };
+    const [event] = await app.db
+      .insert(caseEvents)
+      .values({
+        orgId: membership.orgId,
+        caseId: id,
+        title: body.title,
+        kind: body.kind,
+        startsAt: new Date(body.starts_at),
+        endsAt: body.ends_at ? new Date(body.ends_at) : undefined,
+        location: body.location,
+        notes: body.notes,
+        metadata: body.metadata ?? {},
+      })
+      .returning();
+    return data(event);
   });
 
   app.post("/v1/cases/:id/members", { preHandler: app.requireAuth }, async (request) => {
-    const membership = await getCurrentMembership(request.supabase!, request.auth!.userId);
+    const { membership } = await getRequestMembership(app.db, request);
     const { id } = parseParams(request, z.object({ id: z.string().uuid() }));
     const body = parseBody(
       request,
       z.object({
         user_id: z.string().uuid(),
-        role: z.enum(["lead", "collab", "viewer"]).default("collab"),
+        role: z.string().default("member"),
       }),
     );
-    const member = unwrap(
-      await request
-        .supabase!.from("case_members")
-        .insert({ ...body, org_id: membership.org_id, case_id: id })
-        .select("*")
-        .single(),
-    );
-    return { data: member };
+    const [member] = await app.db
+      .insert(caseMembers)
+      .values({
+        orgId: membership.orgId,
+        caseId: id,
+        userId: body.user_id,
+        role: body.role,
+      })
+      .onConflictDoUpdate({
+        target: [caseMembers.caseId, caseMembers.userId],
+        set: { role: body.role },
+      })
+      .returning();
+    return data(member);
   });
 }

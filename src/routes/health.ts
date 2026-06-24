@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 
 export async function registerHealthRoutes(app: FastifyInstance) {
@@ -8,12 +9,33 @@ export async function registerHealthRoutes(app: FastifyInstance) {
   }));
 
   app.get("/ready", async () => {
-    const { error } = await app.supabaseAdmin.from("organizations").select("id").limit(1);
+    const checks = {
+      database: { ok: true as boolean, message: undefined as string | undefined },
+      storage: { ok: true as boolean, message: undefined as string | undefined },
+    };
+
+    try {
+      await app.db.execute(sql`select 1`);
+    } catch (error) {
+      checks.database = {
+        ok: false,
+        message: error instanceof Error ? error.message : "Database check failed",
+      };
+    }
+
+    try {
+      await app.storage.healthCheck();
+    } catch (error) {
+      checks.storage = {
+        ok: false,
+        message: error instanceof Error ? error.message : "Storage check failed",
+      };
+    }
+
+    const ready = Object.values(checks).every((check) => check.ok);
     return {
-      status: error ? "degraded" : "ready",
-      checks: {
-        supabase: error ? { ok: false, message: error.message } : { ok: true },
-      },
+      status: ready ? "ready" : "degraded",
+      checks,
       timestamp: new Date().toISOString(),
     };
   });

@@ -1,5 +1,3 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
-
 export type OrgRole = "owner" | "partner" | "associate" | "paralegal" | "client";
 
 export type AuthContext = {
@@ -14,5 +12,3 @@ export type OrganizationMembership = {
   role: OrgRole;
   status?: string;
 };
-
-export type RequestSupabase = SupabaseClient;

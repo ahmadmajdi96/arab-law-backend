@@ -36,10 +36,13 @@ function configureSafeBenchmarkEnv() {
   process.env.HOST ??= "127.0.0.1";
   process.env.PORT ??= "3000";
   process.env.LOG_LEVEL = "silent";
-  process.env.SUPABASE_URL ??= "https://example.supabase.co";
-  process.env.SUPABASE_PUBLISHABLE_KEY ??= "benchmark-publishable-key";
-  process.env.SUPABASE_SERVICE_ROLE_KEY ??= "benchmark-service-role-key";
-  process.env.SUPABASE_JWT_SECRET ??= "";
+  process.env.DATABASE_URL ??= "postgres://benchmark:benchmark@127.0.0.1:5432/benchmark";
+  process.env.JWT_SECRET ??= "benchmark-jwt-secret-with-at-least-32-characters";
+  process.env.S3_ENDPOINT ??= "http://127.0.0.1:9000";
+  process.env.S3_REGION ??= "us-east-1";
+  process.env.S3_ACCESS_KEY_ID ??= "benchmark-access-key";
+  process.env.S3_SECRET_ACCESS_KEY ??= "benchmark-secret-key";
+  process.env.S3_BUCKET ??= "documents";
   process.env.NOVITA_API_KEY ??= "benchmark-novita-key";
   process.env.NOVITA_AI_BASE_URL ??= "https://api.novita.ai/openai";
   process.env.AI_DEFAULT_MODEL ??= "deepseek/deepseek-r1";
